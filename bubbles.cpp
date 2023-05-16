@@ -25,26 +25,24 @@ bool Simulation::is_on_boundary(int x, int y) {
   return false;
 }
 
-bool Simulation::is_on_bboundary(int x, int y) {
-  if (x > x_max)
-    return false;
-  if (y > y_max)
-    return false;
-  if (x >= 0 && y >= 0 && grid[x + x_max * y].on_boundary)
-    return false;
+void Simulation::add_boundary(int x, int y) {
 
-  for (int i = x; i <= x + 1; i++)
-    for (int j = y; j <= y + 1; j++) {
+  if (grid[x + x_max * y].boundary_index >= 0)
+    return;
+  boundary.push_back(Coord(x, y));
+  grid[x + y * x_max].boundary_index = boundary.size() - 1;
+}
 
-      if (i < 0 || i >= x_max)
-        continue;
-      if (j < 0 || j >= y_max)
-        continue;
-      if (grid[i + j * x_max].on_boundary)
-        return true;
-    }
+void Simulation::remove_boundary(int x, int y) {
 
-  return false;
+  int index = grid[x + y * x_max].boundary_index;
+  if (index < 0)
+    return;
+  auto &last_entry = boundary.back();
+  boundary[index] = last_entry;
+  grid[last_entry.x + x_max * last_entry.y].boundary_index = index;
+  boundary.pop_back();
+  grid[x + y * x_max].boundary_index = -1;
 }
 
 Simulation::Simulation(int x_max, int y_max, const Params &sim_params)
@@ -54,7 +52,7 @@ Simulation::Simulation(int x_max, int y_max, const Params &sim_params)
 
   engine = std::mt19937(rd());
   int num_bubbles = sim_params.bubbles.size();
-  int num_colors = num_bubbles + 1;
+  num_colors = num_bubbles + 1;
   volumes = std::vector<int>(num_colors);
   volumes[0] = x_max * y_max;
   pressures = std::vector<double>(num_colors);
@@ -68,6 +66,11 @@ Simulation::Simulation(int x_max, int y_max, const Params &sim_params)
     for (int x = 0; x < x_max; x++)
       for (int y = 0; y < y_max; y++) {
 
+        auto &cell = grid[x + x_max * y];
+        cell.x = x;
+        cell.y = y;
+        cell.boundary_index = -1;
+
         const Coord &bcoord = sim_params.bubbles[n];
         int dx = x - bcoord.x;
         int dy = y - bcoord.y;
@@ -75,61 +78,37 @@ Simulation::Simulation(int x_max, int y_max, const Params &sim_params)
 
         if (r2 <= rs2) {
           volumes[grid[x + x_max * y].color]--;
-          grid[x + x_max * y].init_colors(n + 1);
+          grid[x + x_max * y].color = n + 1;
           volumes[n + 1]++;
         }
       }
+     
   }
 
   for (int n = 0; n < num_colors; n++) {
-
+    V0.push_back(sim_params.targets[n]);
     pressures[n] = sim_params.pressures[n];
     P0V0[n] = pressures[n] * volumes[n];
   }
 
   // build the boundary;
 
-  std::vector<Coord> first_boundary;
-
   for (int x = 0; x < x_max; x++)
     for (int y = 0; y < y_max; y++) {
 
       if (is_on_boundary(x, y)) {
-        first_boundary.push_back(Coord(x, y));
-        grid[x + x_max * y].on_boundary = true;
+        boundary.push_back(Coord(x, y));
+        grid[x + x_max * y].boundary_index = boundary.size() - 1;
       }
     }
 
-  boundary_size = first_boundary.size();
-  boundary = (Coord *)malloc(boundary_size * sizeof(Coord));
-  for (int i = 0; i < boundary_size; i++)
-    boundary[i] = first_boundary[i];
-
-  // now build the first bboundary
-
-  std::vector<Coord> first_bboundary;
-  for (int x = -1; x < x_max; x++)
-    for (int y = -1; y < y_max; y++) {
-
-      if (is_on_bboundary(x, y)) {
-        first_bboundary.push_back(Coord(x, y));
-        if (x >= 0 && y >= 0)
-        grid[x + x_max * y].on_bboundary = true;
-      }
-  }
-
-  bboundary_size = first_bboundary.size();
-  bboundary = (Coord *)malloc(bboundary_size * sizeof(Coord));
+  surface_area = find_surface_area();
 }
 
-Simulation::~Simulation() {
-  free(grid);
-  free(boundary);
-  free(bboundary);
-}
+Simulation::~Simulation() { free(grid); }
 
 double Simulation::local_sa_color(int x, int y, int color, int fx, int fy,
-                                  int fcolor, WHICH_COLOR which) {
+                                  int fcolor) {
 
   unsigned char index = 0b0000;
   unsigned char mask = 1;
@@ -143,7 +122,7 @@ double Simulation::local_sa_color(int x, int y, int color, int fx, int fy,
         continue;
 
       int test_color =
-          (i == fx && j == fy) ? fcolor : grid[i + x_max * j].get_color(which);
+          (i == fx && j == fy) ? fcolor : grid[i + x_max * j].color;
       if (test_color == color)
         index ^= mask;
 
@@ -161,8 +140,7 @@ bool color_is_present(int *colors, int size, int color) {
   return false;
 }
 
-double Simulation::local_sa(int x, int y, int fx, int fy, int fcolor,
-                            WHICH_COLOR which) {
+double Simulation::local_sa(int x, int y, int fx, int fy, int fcolor) {
 
   u_int64_t mask = 1;
 
@@ -177,35 +155,32 @@ double Simulation::local_sa(int x, int y, int fx, int fy, int fcolor,
       if (j < 0 || j >= y_max)
         continue;
 
-      int pot_color =
-          (i == fx && j == fy) ? fcolor : grid[i + x_max * j].get_color(which);
+      int pot_color = (i == fx && j == fy) ? fcolor : grid[i + x_max * j].color;
       if (!color_is_present(local_colors, num_local_colors, pot_color))
         local_colors[num_local_colors++] = pot_color;
     }
 
   double local_sa = 0;
   for (int i = 0; i < num_local_colors; i++) {
-    if (local_colors[i] == 0)
-      continue;
-    local_sa += local_sa_color(x, y, local_colors[i], fx, fy, fcolor, which);
+    //if (local_colors[i] == 0)
+      //continue;
+    local_sa += local_sa_color(x, y, local_colors[i], fx, fy, fcolor);
   }
 
   return local_sa;
 }
 
-double Simulation::local_sa(int x, int y, WHICH_COLOR which) {
+double Simulation::local_sa(int x, int y) {
 
-  return local_sa(x, y, -10, -10, -1, which);
+  return local_sa(x, y, -10, -10, -1);
 }
-double Simulation::find_surface_area(WHICH_COLOR which) {
+double Simulation::find_surface_area() {
 
   double sa = 0;
 
-  for (int i = 0; i < boundary_size; i++)
-    sa += local_sa(boundary[i].x, boundary[i].y, which);
-
-  for (int i = 0; i < bboundary_size; i++)
-    sa += local_sa(bboundary[i].x, bboundary[i].y, which);
+  for (int i = 0; i < x_max; i++)
+    for (int j = 0; j < y_max; j++)
+      sa += local_sa(i, j);
 
   return sa;
 }
@@ -215,13 +190,21 @@ double Simulation::roll01() {
   return dis(engine);
 }
 
-void Simulation::flip_cell(int x, int y) {
+double sign(double a) { return (a > 0) ? 1 : -1; }
 
+void Simulation::flip_cell() {
+
+  double aroll = roll01();
+
+  Coord &cell = boundary[floor(aroll * boundary.size())];
+  int x = cell.x;
+  int y = cell.y;
   if (x < 0 || x >= x_max)
     return;
   if (y < 0 || y >= y_max)
     return;
 
+  int old_color = grid[x + y * x_max].color;
   int local_colors[9];
   int num_local_colors = 0;
   double probs[9];
@@ -238,155 +221,66 @@ void Simulation::flip_cell(int x, int y) {
       if (j < 0 || j >= y_max)
         continue;
 
-      int test_color = grid[i + x_max * j].old_color;
+      int test_color = grid[i + x_max * j].color;
       if (!color_is_present(local_colors, num_local_colors, test_color))
         local_colors[num_local_colors++] = test_color;
     }
 
-  for (int cnum = 0; cnum < num_local_colors; cnum++) {
+  long roll = floor(roll01() * num_local_colors);
+  int new_color = local_colors[roll];
+  double new_surface_area = surface_area;
+  for (int i = x - 1; i <= x; i++)
+    for (int j = y - 1; j <= y; j++) {
 
-    double old_sa = 0;
-    double new_sa = 0;
-    for (int i = x - 1; i <= x; i++)
-      for (int j = y - 1; j <= y; j++) {
-        old_sa += local_sa(i, j, -1, -1, -1, OLD);
-        new_sa += local_sa(i, j, x, y, cnum, OLD);
+      new_surface_area -= local_sa(i, j);
+      new_surface_area += local_sa(i, j, x, y, new_color);
+    }
+  double ep_old = 0;
+  double ep_new = 0;
+  for (int i = 1; i < num_colors; i++) {
+    double ep_change_o = volumes[i] - V0[i];
+    double ep_change_n = ep_change_o;
+    if (i == new_color) ep_change_n++;
+    if (i == old_color) ep_change_n--; 
+    ep_old += pow(ep_change_o, 2);
+    ep_new += pow(ep_change_n, 2);
+  }
+  double delta_ep = ep_new - ep_old;
+  double delta_sa = new_surface_area - surface_area;
+
+  double de = k_p * pow(delta_ep, 1) + k_a  * pow(delta_sa, 1);
+  double prob = exp(-de / T);
+  if (roll01() < prob) {
+
+    grid[x + x_max * y].color = new_color;
+    surface_area = new_surface_area;
+    volumes[old_color]--;
+    volumes[new_color]++;
+
+    if (old_color != 0)
+      pressures[old_color] = P0V0[old_color] / volumes[old_color];
+    if (new_color != 0)
+      pressures[new_color] = P0V0[new_color] / volumes[new_color];
+    for (int i = x - 1; i <= x + 1; i++) {
+      for (int j = y - 1; j <= y + 1; j++) {
+
+        if (i < 0 || i >= x_max)
+          continue;
+        if (j < 0 || j >= y_max)
+          continue;
+        if (!is_on_boundary(i, j))
+          remove_boundary(i, j);
+        else
+          add_boundary(i, j);
       }
-
-    double dsa = new_sa - old_sa;
-    double oldp = pressures[grid[x + y * x_max].get_color(OLD)];
-    double newp = pressures[cnum];
-    double dp = oldp - newp;
-
-    double de = k_a * dsa + k_p * dp;
-
-    double likelihood = exp(-de);
-    probs[cnum] = likelihood;
-    sum_probs += likelihood;
-  }
-
-  for (int cnum = 0; cnum < num_local_colors; cnum++)
-    probs[cnum] /= sum_probs;
-
-  double aggprob = 0;
-  int flip_index = 0;
-  double roll = roll01();
-  while (flip_index <= num_local_colors) {
-    aggprob += probs[flip_index];
-    if (roll <= aggprob)
-      break;
-    flip_index++;
-  }
-
-  grid[x + x_max * y].set_new_color(local_colors[flip_index]);
-}
-
-void Simulation::rebuild() {
-
-  std::vector<Coord> new_boundary;
-
-  std::vector<int> newv(volumes.size());
-  for (int i = 0; i < volumes.size(); i++)
-    newv[i] = volumes[i];
-
-  for (int i = 0; i < boundary_size; i++) {
-
-    Coord cellcoords = boundary[i];
-    auto *cell = &grid[cellcoords.x + x_max * cellcoords.y];
-    cell->on_boundary = false;
-    if (cell->get_color(COLOR) != cell->get_color(OLD)) {
-      newv[cell->get_color(COLOR)]--;
-      newv[cell->get_color(OLD)]++;
-    }
-    cell->init_colors(cell->get_color(OLD));
-  }
-
-  for (int i = 0; i < boundary_size; i++) {
-
-    if (is_on_boundary(boundary[i].x, boundary[i].y)) {
-      new_boundary.push_back(boundary[i]);
-      grid[boundary[i].x + x_max * boundary[i].y].on_boundary = true;
     }
   }
 
-  for (int i = 0; i < bboundary_size; i++) {
-    if (bboundary[i].x >= 0 && bboundary[i].y >= 0)
-      grid[bboundary[i].x + x_max * bboundary[i].y].on_bboundary = false;
-    if (is_on_boundary(bboundary[i].x, bboundary[i].y)) {
-      new_boundary.push_back(bboundary[i]);
-      grid[bboundary[i].x + x_max * bboundary[i].y].on_boundary = true;
-    }
-  }
-
-  std::vector<bool> already_placed_bboundary_i(x_max, false);
-  std::vector<bool> already_placed_bboundary_j(y_max, false);
-  std::vector<Coord> new_bboundary;
-  for (int n = 0; n < new_boundary.size(); n++) {
-
-    auto cell = new_boundary[n];
-    for (int i = cell.x - 1; i < cell.x; i++)
-      for (int j = cell.y - 1; j < cell.y; j++) {
-        if (i < 0 || already_placed_bboundary_i[i])
-          continue;
-        if (j < 0 || already_placed_bboundary_j[j])
-          continue;
-        if (grid[i + x_max * j].on_boundary)
-          continue;
-        if (is_on_bboundary(i, j)) {
-
-          new_bboundary.push_back(Coord(i, j));
-          if (i >= 0 && j >= 0)
-            grid[i + x_max * j].on_bboundary = true;
-          if (i < 0) already_placed_bboundary_i[i] = true;
-          if (j < 0) already_placed_bboundary_j[j] = true;
-        }
-      }
-  }
-
-  free(boundary);
-  free(bboundary);
-  boundary = (Coord *)malloc(new_boundary.size() * sizeof(Coord));
-  for (int i = 0; i < new_boundary.size(); i++)
-    boundary[i] = new_boundary[i];
-  boundary_size = new_boundary.size();
-  bboundary = (Coord *)malloc(new_bboundary.size() * sizeof(Coord));
-  for (int i = 0; i < new_bboundary.size(); i++)
-    bboundary[i] = new_bboundary[i];
-  bboundary_size = new_bboundary.size();
-  for (int i = 0; i < num_colors; i++) {
-    volumes[i] = newv[i];
-    pressures[i] = P0V0[i] / volumes[i];
-  }
+  T *= .9999995;
 }
 
 void Simulation::run_sim_iteration() {
 
-  double sa0 = find_surface_area(COLOR);
-  for (int iter = 0; iter < 30; iter++) {
-    double dep = 0;
-    for (int i = 0; i < boundary_size; i++) {
-      auto cell = boundary[i];
-      flip_cell(cell.x, cell.y);
-      if (grid[cell.x + x_max * cell.y].get_color(NEW) !=
-          grid[cell.x + x_max * cell.y].get_color(OLD)) {
-
-        dep += pressures[grid[cell.x + x_max * cell.y].get_color(OLD)] -
-               pressures[grid[cell.x + x_max * cell.y].get_color(NEW)];
-      }
-    }
-
-    double sa1 = find_surface_area(NEW);
-    double dsa = sa1 - sa0;
-
-    double de = k_a * dsa + k_p * dep;
-    double prob = std::min(1.0, exp(-de));
-    double roll = roll01();
-    if (roll < prob) {
-      for (int i = 0; i < boundary_size; i++)
-        grid[boundary[i].x + x_max * boundary[i].y].old_color =
-            grid[boundary[i].x + x_max * boundary[i].y].new_color;
-      sa0 = sa1;
-    }
-  }
-  rebuild();
+  for (int i = 0; i < 100000; i++)
+    flip_cell();
 }
